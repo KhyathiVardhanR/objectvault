@@ -21,7 +21,9 @@ namespace ov {
 
 class GroupSync {
  public:
-  explicit GroupSync(const std::string& path) { fd_ = ::open(path.c_str(), O_RDWR | O_CREAT, 0644); }
+  // The file is opened on first use: the node's data directory may not exist
+  // yet when this object is constructed.
+  explicit GroupSync(std::string path) : path_(std::move(path)) {}
   ~GroupSync() {
     if (fd_ >= 0) ::close(fd_);
   }
@@ -37,8 +39,9 @@ class GroupSync {
       }
       running_ = true;
       uint64_t target = requested_;
+      if (fd_ < 0) fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT, 0644);
       lk.unlock();
-      bool ok = ::fcntl(fd_, F_FULLFSYNC) == 0;
+      bool ok = fd_ >= 0 && ::fcntl(fd_, F_FULLFSYNC) == 0;
       lk.lock();
       running_ = false;
       completed_ = target;
@@ -55,6 +58,7 @@ class GroupSync {
   uint64_t flushes() const { return flushes_; }
 
  private:
+  std::string path_;
   int fd_ = -1;
   std::mutex mu_;
   std::condition_variable cv_;
