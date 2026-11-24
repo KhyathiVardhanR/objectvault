@@ -129,7 +129,10 @@ With Docker (5 storage nodes, PostgreSQL, Redis, and Prometheus on :9090):
 
 ```bash
 docker compose up -d --build
+docker compose kill s2        # the gateway marks s2 down and re-replicates its chunks
 ```
+
+This stack was verified end to end: a 20 MB object round-trips byte-identical, killing a storage container is detected and full redundancy is restored, and Prometheus scrapes the gateway and every storage node.
 
 ### Prometheus metrics
 
