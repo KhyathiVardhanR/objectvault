@@ -4,7 +4,8 @@
 #   scripts/cluster.sh stop
 #   scripts/cluster.sh kill-node s2  (SIGKILL one storage node)
 #   scripts/cluster.sh start-node s2
-# Extra gateway flags can be passed with GATEWAY_ARGS="--no-cache ...".
+# Extra flags: GATEWAY_ARGS="--no-cache ...", STORAGE_ARGS="--scrub-interval 0 ...".
+# PostgreSQL and Redis are both reached over Unix sockets (same host).
 set -euo pipefail
 export LC_ALL=${LC_ALL:-en_US.UTF-8}
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -33,7 +34,8 @@ start)
   fi
   "$PG_BIN/pg_ctl" -D "$DATA/pg" -o "-p $PG_PORT -k /tmp" -l "$DATA/logs/pg.log" -w start >/dev/null
   "$PG_BIN/createdb" -h /tmp -p $PG_PORT -U postgres objectvault 2>/dev/null || true
-  redis-server --port $REDIS_PORT --save "" --appendonly no --daemonize yes --pidfile "$DATA/redis.pid" \
+  redis-server --port $REDIS_PORT --unixsocket /tmp/ov-redis.sock --unixsocketperm 700 \
+    --save "" --appendonly no --daemonize yes --pidfile "$DATA/redis.pid" \
     --logfile "$DATA/logs/redis.log"
   NODES=""
   for i in $(seq 1 "$N"); do
@@ -44,7 +46,7 @@ start)
   sleep 0.5
   # shellcheck disable=SC2086
   "$BIN/ov-gateway" --listen 127.0.0.1:8080 --metrics 127.0.0.1:9200 --nodes "$NODES" \
-    --pg "host=/tmp port=$PG_PORT user=postgres dbname=objectvault" --redis 127.0.0.1:$REDIS_PORT \
+    --pg "host=/tmp port=$PG_PORT user=postgres dbname=objectvault" --redis unix:/tmp/ov-redis.sock \
     ${GATEWAY_ARGS:-} >>"$DATA/logs/gateway.log" 2>&1 &
   echo $! >"$DATA/gateway.pid"
   for _ in $(seq 1 50); do curl -sf localhost:8080/healthz >/dev/null && break; sleep 0.1; done
