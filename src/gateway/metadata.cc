@@ -117,7 +117,8 @@ redisContext* MetaStore::redis() {
 }
 
 void MetaStore::init_schema() {
-  pqxx::work tx(pg());
+  pqxx::connection c(conninfo_);  // plain connection: statements are prepared after the schema exists
+  pqxx::work tx(c);
   tx.exec(kSchema);
   tx.commit();
 }
