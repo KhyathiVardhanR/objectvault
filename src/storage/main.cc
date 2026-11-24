@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "common/util.h"
+#include "storage/group_sync.h"
 #include "storage.grpc.pb.h"
 
 namespace fs = std::filesystem;
@@ -71,7 +72,7 @@ class StorageNode final : public objectvault::Storage::Service {
         fs::remove(e.path());  // incomplete writes from a crash
         continue;
       }
-      if (parent == "quarantine") continue;
+      if (parent == "quarantine" || e.path().parent_path() == dir_) continue;
       chunks_++;
       bytes_ += e.file_size() - 32;
     }
@@ -92,7 +93,7 @@ class StorageNode final : public objectvault::Storage::Service {
         for (auto it = fs::recursive_directory_iterator(dir_, ec); it != fs::recursive_directory_iterator(); it.increment(ec)) {
           if (ec || !it->is_regular_file()) continue;
           auto parent = it->path().parent_path().filename().string();
-          if (parent == "tmp" || parent == "quarantine") continue;
+          if (parent == "tmp" || parent == "quarantine" || it->path().parent_path() == dir_) continue;
           std::string id = it->path().filename().string();
           std::string stored, data;
           if (!read_file(it->path(), &stored, &data)) continue;  // deleted meanwhile
@@ -137,6 +138,15 @@ class StorageNode final : public objectvault::Storage::Service {
       return Status(StatusCode::INTERNAL, "write failed");
     }
     fs::rename(tmp, final_path);
+    if (fsync_) {
+      // Persist the rename, then flush the device cache (shared across writers).
+      int dfd = ::open(final_path.parent_path().c_str(), O_RDONLY);
+      if (dfd >= 0) {
+        ::fsync(dfd);
+        ::close(dfd);
+      }
+      if (!sync_.barrier()) return Status(StatusCode::INTERNAL, "device flush failed");
+    }
     if (!existed) {
       chunks_++;
       bytes_ += req->data().size();
@@ -253,6 +263,7 @@ class StorageNode final : public objectvault::Storage::Service {
   prometheus::Histogram& del_lat_;
   std::atomic<int64_t> chunks_{0};
   std::atomic<int64_t> bytes_{0};
+  GroupSync sync_{(dir_ / "barrier").string()};
   std::mutex qmu_;
   std::vector<std::string> newly_quarantined_;
   prometheus::Counter& scrub_passes_ =
