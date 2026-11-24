@@ -530,6 +530,10 @@ int main(int argc, char** argv) {
                            [&](const std::string& node, bool up) {
                              gm.nodes.Add({{"node", node}}).Set(up ? 1 : 0);
                              repair.node_changed(node, up);
+                           },
+                           [&](const std::string& node, const std::string& chunk) {
+                             // Scrubber found a corrupt replica: rewrite it from a good copy.
+                             meta.enqueue_repair(chunk, node);
                            });
   repair.start();
 

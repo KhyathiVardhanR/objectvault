@@ -18,7 +18,10 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "common/util.h"
 #include "storage.grpc.pb.h"
@@ -77,6 +80,39 @@ class StorageNode final : public objectvault::Storage::Service {
     std::cerr << "[" << id_ << "] recovered " << chunks_ << " chunks (" << bytes_ << " bytes) from " << dir_ << "\n";
   }
 
+  // Background scrubber: re-verifies every chunk's SHA-256 at a bounded rate
+  // so silent corruption is found even on replicas that are never read.
+  void start_scrubber(std::chrono::seconds every, double max_mb_per_sec) {
+    std::thread([this, every, max_mb_per_sec] {
+      for (;;) {
+        std::this_thread::sleep_for(every);
+        auto t0 = std::chrono::steady_clock::now();
+        uint64_t scanned = 0, bad = 0;
+        std::error_code ec;
+        for (auto it = fs::recursive_directory_iterator(dir_, ec); it != fs::recursive_directory_iterator(); it.increment(ec)) {
+          if (ec || !it->is_regular_file()) continue;
+          auto parent = it->path().parent_path().filename().string();
+          if (parent == "tmp" || parent == "quarantine") continue;
+          std::string id = it->path().filename().string();
+          std::string stored, data;
+          if (!read_file(it->path(), &stored, &data)) continue;  // deleted meanwhile
+          scanned += data.size();
+          Digest d = sha256(data);
+          if (std::memcmp(d.data(), stored.data(), 32) != 0) {
+            quarantine(id, data.size());
+            bad++;
+          }
+          // rate limit
+          double want = scanned / (max_mb_per_sec * 1e6);
+          double have = seconds_since(t0);
+          if (want > have) std::this_thread::sleep_for(std::chrono::duration<double>(want - have));
+        }
+        scrub_passes_.Increment();
+        if (bad) std::cerr << "[" << id_ << "] scrub found " << bad << " corrupt chunk(s)\n";
+      }
+    }).detach();
+  }
+
   Status PutChunk(ServerContext*, const objectvault::PutChunkRequest* req,
                   objectvault::PutChunkResponse*) override {
     auto t0 = std::chrono::steady_clock::now();
@@ -117,30 +153,17 @@ class StorageNode final : public objectvault::Storage::Service {
     auto t0 = std::chrono::steady_clock::now();
     if (!valid_id(req->chunk_id())) return Status(StatusCode::INVALID_ARGUMENT, "bad chunk id");
     fs::path p = path_for(req->chunk_id());
-    std::ifstream in(p, std::ios::binary);
-    if (!in) return Status(StatusCode::NOT_FOUND, "no such chunk");
-    std::string stored(32, '\0');
-    in.read(stored.data(), 32);
+    std::string stored;
     std::string* data = resp->mutable_data();
-    in.seekg(0, std::ios::end);
-    auto size = static_cast<size_t>(in.tellg()) - 32;
-    in.seekg(32);
-    data->resize(size);
-    in.read(data->data(), size);
+    if (!read_file(p, &stored, data)) return Status(StatusCode::NOT_FOUND, "no such chunk");
     Digest d = sha256(*data);
-    if (!in || std::memcmp(d.data(), stored.data(), 32) != 0) {
+    if (std::memcmp(d.data(), stored.data(), 32) != 0) {
       // Bit rot or tampering: quarantine so repair re-replicates a good copy.
-      m_.checksum_failures.Increment();
-      std::error_code ec;
-      fs::rename(p, dir_ / "quarantine" / req->chunk_id(), ec);
-      if (!ec) {
-        chunks_--;
-        bytes_ -= size;
-      }
+      quarantine(req->chunk_id(), data->size());
       return Status(StatusCode::DATA_LOSS, "checksum mismatch on read");
     }
     resp->set_sha256(stored);
-    m_.bytes_out.Increment(size);
+    m_.bytes_out.Increment(static_cast<double>(data->size()));
     get_lat_.Observe(seconds_since(t0));
     return Status::OK;
   }
@@ -167,10 +190,40 @@ class StorageNode final : public objectvault::Storage::Service {
     resp->set_chunks(chunks_);
     resp->set_bytes_used(bytes_);
     resp->set_checksum_failures(static_cast<uint64_t>(m_.checksum_failures.Value()));
+    std::lock_guard<std::mutex> g(qmu_);
+    for (auto& id : newly_quarantined_) resp->add_quarantined(id);
+    newly_quarantined_.clear();
     return Status::OK;
   }
 
  private:
+  static bool read_file(const fs::path& p, std::string* stored, std::string* data) {
+    std::ifstream in(p, std::ios::binary);
+    if (!in) return false;
+    in.seekg(0, std::ios::end);
+    auto total = static_cast<size_t>(in.tellg());
+    if (total < 32) return false;
+    in.seekg(0);
+    stored->resize(32);
+    in.read(stored->data(), 32);
+    data->resize(total - 32);
+    in.read(data->data(), static_cast<std::streamsize>(total - 32));
+    return static_cast<bool>(in);
+  }
+
+  void quarantine(const std::string& id, size_t size) {
+    m_.checksum_failures.Increment();
+    std::error_code ec;
+    fs::rename(path_for(id), dir_ / "quarantine" / id, ec);
+    if (ec) return;
+    chunks_--;
+    bytes_ -= static_cast<int64_t>(size);
+    m_.chunks.Set(chunks_);
+    m_.used.Set(bytes_);
+    std::lock_guard<std::mutex> g(qmu_);
+    newly_quarantined_.push_back(id);
+  }
+
   static bool valid_id(const std::string& id) {
     if (id.size() < 8 || id.size() > 64) return false;
     for (char c : id)
@@ -200,6 +253,10 @@ class StorageNode final : public objectvault::Storage::Service {
   prometheus::Histogram& del_lat_;
   std::atomic<int64_t> chunks_{0};
   std::atomic<int64_t> bytes_{0};
+  std::mutex qmu_;
+  std::vector<std::string> newly_quarantined_;
+  prometheus::Counter& scrub_passes_ =
+      prometheus::BuildCounter().Name("ov_storage_scrub_passes_total").Help("Completed scrub passes").Register(*m_.reg).Add({});
 };
 
 }  // namespace ov
@@ -207,6 +264,8 @@ class StorageNode final : public objectvault::Storage::Service {
 int main(int argc, char** argv) {
   std::string id = "s1", listen = "0.0.0.0:9001", dir = "data/s1", metrics = "0.0.0.0:9201";
   bool fsync_writes = true;
+  int scrub_every = 60;
+  double scrub_mbps = 200;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -215,8 +274,11 @@ int main(int argc, char** argv) {
     else if (a == "--dir") dir = next();
     else if (a == "--metrics") metrics = next();
     else if (a == "--no-fsync") fsync_writes = false;
+    else if (a == "--scrub-interval") scrub_every = std::stoi(next());
+    else if (a == "--scrub-rate-mb") scrub_mbps = std::stod(next());
     else {
-      std::cerr << "usage: ov-storage --id ID --listen HOST:PORT --dir DIR --metrics HOST:PORT [--no-fsync]\n";
+      std::cerr << "usage: ov-storage --id ID --listen HOST:PORT --dir DIR --metrics HOST:PORT [--no-fsync]\n"
+                   "                  [--scrub-interval SECONDS (0=off)] [--scrub-rate-mb MB/s]\n";
       return 2;
     }
   }
@@ -224,6 +286,7 @@ int main(int argc, char** argv) {
   prometheus::Exposer exposer{metrics};
   exposer.RegisterCollectable(m.reg);
   ov::StorageNode node(id, dir, fsync_writes, m);
+  if (scrub_every > 0) node.start_scrubber(std::chrono::seconds(scrub_every), scrub_mbps);
 
   grpc::ServerBuilder b;
   b.AddListeningPort(listen, grpc::InsecureServerCredentials());

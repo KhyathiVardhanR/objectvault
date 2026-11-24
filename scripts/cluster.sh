@@ -20,7 +20,7 @@ node_addr() { echo "127.0.0.1:$((9000 + ${1#s}))"; }
 start_node() {
   local id=$1
   "$BIN/ov-storage" --id "$id" --listen "$(node_addr "$id")" --dir "$DATA/$id" \
-    --metrics "127.0.0.1:$((9100 + ${id#s}))" >>"$DATA/logs/$id.log" 2>&1 &
+    --metrics "127.0.0.1:$((9100 + ${id#s}))" ${STORAGE_ARGS:-} >>"$DATA/logs/$id.log" 2>&1 &
   echo $! >"$DATA/$id.pid"
 }
 

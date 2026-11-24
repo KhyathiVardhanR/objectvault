@@ -17,6 +17,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <set>
 #include <string>
 #include <thread>
@@ -160,9 +161,13 @@ class Cluster {
   // Replicas that fail verification are reported through on_corrupt.
   bool read_verified(const std::string& id, const Digest& expect, const std::vector<std::string>& nodes,
                      std::string* out, const std::function<void(const std::string&)>& on_corrupt) {
+    // Healthy replicas first, in random order (spreads read load and makes
+    // reads exercise every replica); down nodes last as a fallback.
     std::vector<std::string> order;
     for (const auto& n : nodes)
       if (is_up(n)) order.push_back(n);
+    thread_local std::mt19937 rng{std::random_device{}()};
+    std::shuffle(order.begin(), order.end(), rng);
     for (const auto& n : nodes)
       if (!is_up(n)) order.push_back(n);
     for (const auto& n : order) {
@@ -184,7 +189,8 @@ class Cluster {
 
   // Heartbeats every node; a node is down after `threshold` consecutive misses.
   void start_heartbeats(std::chrono::milliseconds every, int threshold,
-                        std::function<void(const std::string&, bool)> on_change) {
+                        std::function<void(const std::string&, bool)> on_change,
+                        std::function<void(const std::string&, const std::string&)> on_quarantined) {
     hb_ = std::thread([=, this] {
       for (;;) {
         for (auto& [id, stub] : stubs_) {
@@ -193,6 +199,8 @@ class Cluster {
           grpc::ClientContext ctx;
           ctx.set_deadline(std::chrono::system_clock::now() + every);
           bool ok = stub->Stat(&ctx, req, &resp).ok();
+          if (ok)
+            for (const auto& q : resp.quarantined()) on_quarantined(id, q);
           bool changed = false, now_up = false;
           {
             std::lock_guard<std::mutex> g(mu_);

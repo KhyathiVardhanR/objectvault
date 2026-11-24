@@ -41,4 +41,6 @@ message StatResponse {
   uint64 chunks = 2;
   uint64 bytes_used = 3;
   uint64 checksum_failures = 4;
+  // Chunks the node quarantined (failed verification) since the last Stat.
+  repeated string quarantined = 5;
 }
