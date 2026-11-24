@@ -1,0 +1,63 @@
+# ObjectVault: gateway + 5 storage nodes + PostgreSQL + Redis + Prometheus
+#   docker compose up -d --build
+#   curl -X PUT localhost:8080/photos && curl -X PUT --data-binary @file localhost:8080/photos/file
+#   docker compose kill s2          # watch ov_replication_health in Prometheus (localhost:9090)
+x-storage: &storage
+  image: objectvault:latest
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: objectvault
+      POSTGRES_DB: objectvault
+    volumes: [pg-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 2s
+      retries: 30
+
+  redis:
+    image: redis:7
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+  s1: { <<: *storage, command: ["ov-storage", "--id", "s1", "--listen", "0.0.0.0:9001", "--dir", "/data", "--metrics", "0.0.0.0:9100"], volumes: [s1:/data] }
+  s2: { <<: *storage, command: ["ov-storage", "--id", "s2", "--listen", "0.0.0.0:9001", "--dir", "/data", "--metrics", "0.0.0.0:9100"], volumes: [s2:/data] }
+  s3: { <<: *storage, command: ["ov-storage", "--id", "s3", "--listen", "0.0.0.0:9001", "--dir", "/data", "--metrics", "0.0.0.0:9100"], volumes: [s3:/data] }
+  s4: { <<: *storage, command: ["ov-storage", "--id", "s4", "--listen", "0.0.0.0:9001", "--dir", "/data", "--metrics", "0.0.0.0:9100"], volumes: [s4:/data] }
+  s5: { <<: *storage, command: ["ov-storage", "--id", "s5", "--listen", "0.0.0.0:9001", "--dir", "/data", "--metrics", "0.0.0.0:9100"], volumes: [s5:/data] }
+
+  gateway:
+    build: .
+    image: objectvault:latest
+    restart: unless-stopped
+    command:
+      - ov-gateway
+      - --listen=0.0.0.0:8080
+      - --metrics=0.0.0.0:9200
+      - --nodes=s1=s1:9001,s2=s2:9001,s3=s3:9001,s4=s4:9001,s5=s5:9001
+      - --pg=host=postgres user=postgres password=objectvault dbname=objectvault
+      - --redis=redis:6379
+    ports: ["8080:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+      s1: { condition: service_started }
+      s2: { condition: service_started }
+      s3: { condition: service_started }
+      s4: { condition: service_started }
+      s5: { condition: service_started }
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes: [./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro]
+    ports: ["9090:9090"]
+
+volumes:
+  pg-data:
+  s1:
+  s2:
+  s3:
+  s4:
+  s5:

@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 2s
+
+scrape_configs:
+  - job_name: gateway
+    static_configs:
+      - targets: ["gateway:9200"]
+  - job_name: storage
+    static_configs:
+      - targets: ["s1:9100", "s2:9100", "s3:9100", "s4:9100", "s5:9100"]
+
+# Useful queries
+#   sum(rate(ov_http_bytes_total{dir="in"}[30s])) / 1e6                       upload MB/s
+#   histogram_quantile(0.99, sum by (le, op) (rate(ov_http_request_seconds_bucket[1m])))
+#   sum by (source) (rate(ov_metadata_lookup_seconds_sum[1m])) / sum by (source) (rate(ov_metadata_lookup_seconds_count[1m]))
+#   sum(rate(ov_metadata_cache_total{result="hit"}[1m])) / sum(rate(ov_metadata_cache_total[1m]))   cache hit rate
+#   ov_replication_health{kind="under_replicated_chunks"}, ov_storage_node_up
+#   sum by (instance) (ov_storage_usage{kind="bytes"})                         storage utilization per node
+#   increase(ov_storage_checksum_failures_total[1h])
