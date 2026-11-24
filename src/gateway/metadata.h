@@ -7,6 +7,10 @@
 #include <hiredis/hiredis.h>
 
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -102,13 +106,29 @@ class MetaStore {
  private:
   pqxx::connection& pg();
   redisContext* redis();
-  void cache_put(const std::string& ck, const ObjectMeta& m);
-  std::optional<ObjectMeta> cache_get(const std::string& ck);
+  void cache_put(const std::string& ck, const ObjectMeta& m, const std::string& inv_version);
+  // Returns the cached value, and in *inv_version the key's invalidation
+  // counter as observed in the same round trip (used to make fills safe).
+  std::optional<ObjectMeta> cache_get(const std::string& ck, std::string* inv_version);
   void cache_del(const std::string& ck);
   static std::string cache_key(const std::string& bucket, const std::string& key) {
     return "ov:meta:" + bucket + "/" + key;
   }
   std::vector<ChunkRef> load_chunks(pqxx::work& tx, int64_t object_id);
+
+  void filler_loop();
+
+  // Cache fills run on a background thread so a miss costs the caller only
+  // the Redis GET plus the database query, not the SET.
+  std::mutex fill_mu_;
+  std::condition_variable fill_cv_;
+  struct Fill {
+    std::string key;
+    ObjectMeta meta;
+    std::string inv_version;
+  };
+  std::deque<Fill> fills_;
+  std::thread filler_;
 
   std::string conninfo_;
   std::string redis_host_;

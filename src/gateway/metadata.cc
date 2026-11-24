@@ -91,7 +91,24 @@ void prepare_all(pqxx::connection& c) {
 MetaStore::MetaStore(std::string pg_conninfo, std::string redis_host, int redis_port, bool cache_enabled,
                      int cache_ttl_seconds)
     : conninfo_(std::move(pg_conninfo)), redis_host_(std::move(redis_host)), redis_port_(redis_port),
-      cache_enabled_(cache_enabled), ttl_(cache_ttl_seconds) {}
+      cache_enabled_(cache_enabled), ttl_(cache_ttl_seconds) {
+  if (cache_enabled_) {
+    filler_ = std::thread([this] { filler_loop(); });
+    filler_.detach();
+  }
+}
+
+void MetaStore::filler_loop() {
+  for (;;) {
+    std::deque<Fill> batch;
+    {
+      std::unique_lock<std::mutex> lk(fill_mu_);
+      fill_cv_.wait(lk, [this] { return !fills_.empty(); });
+      batch.swap(fills_);
+    }
+    for (auto& f : batch) cache_put(f.key, f.meta, f.inv_version);
+  }
+}
 
 pqxx::connection& MetaStore::pg() {
   thread_local std::unique_ptr<pqxx::connection> conn;
@@ -207,8 +224,9 @@ std::vector<ChunkRef> MetaStore::put_object(const ObjectMeta& m) {
 
 std::optional<ObjectMeta> MetaStore::get_object(const std::string& bucket, const std::string& key, Source* src) {
   const std::string ck = cache_key(bucket, key);
+  std::string inv;
   if (cache_enabled_) {
-    if (auto hit = cache_get(ck)) {
+    if (auto hit = cache_get(ck, &inv)) {
       if (src) *src = Source::Cache;
       return hit;
     }
@@ -229,7 +247,11 @@ std::optional<ObjectMeta> MetaStore::get_object(const std::string& bucket, const
     m.chunks.push_back({row[5].as<std::string>(), row[6].as<int64_t>(), row[7].as<std::string>(),
                         split_csv(row[8].as<std::string>())});
   }
-  if (cache_enabled_) cache_put(ck, m);
+  if (cache_enabled_) {
+    std::lock_guard<std::mutex> g(fill_mu_);
+    if (fills_.size() < 100000) fills_.push_back({ck, m, inv});
+    fill_cv_.notify_one();
+  }
   return m;
 }
 
@@ -462,28 +484,44 @@ static std::string versioned(const std::string& ck) {
   return std::to_string(g_cache_generation.load()) + ":" + ck;
 }
 
-void MetaStore::cache_put(const std::string& ck, const ObjectMeta& m) {
+// Fill only if the key was not invalidated since our read observed it.
+static const char* kFillScript =
+    "local v = redis.call('GET', KEYS[2]) or '' "
+    "if v == ARGV[2] then redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3]) return 1 end return 0";
+
+void MetaStore::cache_put(const std::string& ck, const ObjectMeta& m, const std::string& inv_version) {
   json j{{"s", m.size}, {"e", m.etag}, {"t", m.content_type}, {"c", m.created}};
   auto& arr = j["k"] = json::array();
   for (const auto& c : m.chunks) arr.push_back({c.id, c.size, c.sha256_hex, c.nodes});
   auto payload = j.dump();
   auto key = versioned(ck);
+  auto inv_key = "inv:" + ck;
+  auto ttl = std::to_string(ttl_);
   if (auto* r = redis()) {
-    auto* reply = static_cast<redisReply*>(
-        redisCommand(r, "SET %b %b EX %d", key.data(), key.size(), payload.data(), payload.size(), ttl_));
+    auto* reply = static_cast<redisReply*>(redisCommand(r, "EVAL %s 2 %b %b %b %b %b", kFillScript, key.data(),
+                                                        key.size(), inv_key.data(), inv_key.size(), payload.data(),
+                                                        payload.size(), inv_version.data(), inv_version.size(),
+                                                        ttl.data(), ttl.size()));
     if (reply) freeReplyObject(reply);
   }
 }
 
-std::optional<ObjectMeta> MetaStore::cache_get(const std::string& ck) {
+std::optional<ObjectMeta> MetaStore::cache_get(const std::string& ck, std::string* inv_version) {
   auto* r = redis();
   if (!r || r->err) return std::nullopt;
   auto key = versioned(ck);
-  auto* reply = static_cast<redisReply*>(redisCommand(r, "GET %b", key.data(), key.size()));
+  auto inv_key = "inv:" + ck;
+  auto* reply = static_cast<redisReply*>(
+      redisCommand(r, "MGET %b %b", key.data(), key.size(), inv_key.data(), inv_key.size()));
   if (!reply) return std::nullopt;
   std::optional<ObjectMeta> out;
-  if (reply->type == REDIS_REPLY_STRING) {
-    auto j = json::parse(std::string(reply->str, reply->len), nullptr, false);
+  if (reply->type == REDIS_REPLY_ARRAY && reply->elements == 2) {
+    auto* inv = reply->element[1];
+    inv_version->assign(inv->type == REDIS_REPLY_STRING ? std::string(inv->str, inv->len) : "");
+  }
+  auto* val = reply->type == REDIS_REPLY_ARRAY && reply->elements == 2 ? reply->element[0] : nullptr;
+  if (val && val->type == REDIS_REPLY_STRING) {
+    auto j = json::parse(std::string(val->str, val->len), nullptr, false);
     if (!j.is_discarded()) {
       ObjectMeta m;
       auto slash = ck.find('/', 8);
@@ -504,9 +542,17 @@ std::optional<ObjectMeta> MetaStore::cache_get(const std::string& ck) {
 void MetaStore::cache_del(const std::string& ck) {
   if (!cache_enabled_) return;
   auto key = versioned(ck);
+  auto inv_key = "inv:" + ck;
   if (auto* r = redis()) {
-    auto* reply = static_cast<redisReply*>(redisCommand(r, "DEL %b", key.data(), key.size()));
-    if (reply) freeReplyObject(reply);
+    // Bump the invalidation counter first so in-flight fills are rejected.
+    redisAppendCommand(r, "INCR %b", inv_key.data(), inv_key.size());
+    redisAppendCommand(r, "EXPIRE %b %d", inv_key.data(), inv_key.size(), ttl_ * 2);
+    redisAppendCommand(r, "DEL %b", key.data(), key.size());
+    for (int i = 0; i < 3; i++) {
+      void* reply = nullptr;
+      if (redisGetReply(r, &reply) != REDIS_OK) break;
+      freeReplyObject(reply);
+    }
   }
 }
 
