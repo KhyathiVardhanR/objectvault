@@ -35,3 +35,8 @@ target_link_libraries(ov_common INTERFACE OpenSSL::Crypto Threads::Threads)
 # --- storage node -------------------------------------------------------------
 add_executable(ov-storage src/storage/main.cc)
 target_link_libraries(ov-storage PRIVATE ov_proto ov_common prometheus-cpp::pull)
+
+# --- gateway -------------------------------------------------------------------
+add_executable(ov-gateway src/gateway/main.cc src/gateway/metadata.cc)
+target_link_libraries(ov-gateway PRIVATE ov_proto ov_common prometheus-cpp::pull
+  PkgConfig::PQXX PkgConfig::HIREDIS Boost::headers)
