@@ -277,9 +277,21 @@ int main(int argc, char** argv) {
   bool fsync_writes = true;
   int scrub_every = 60;
   double scrub_mbps = 200;
+  // Accept both "--flag value" and "--flag=value".
+  std::vector<std::string> args;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
-    auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
+    auto eq = a.find('=');
+    if (a.rfind("--", 0) == 0 && eq != std::string::npos) {
+      args.push_back(a.substr(0, eq));
+      args.push_back(a.substr(eq + 1));
+    } else {
+      args.push_back(a);
+    }
+  }
+  for (size_t i = 0; i < args.size(); i++) {
+    std::string a = args[i];
+    auto next = [&]() -> std::string { return i + 1 < args.size() ? args[++i] : ""; };
     if (a == "--id") id = next();
     else if (a == "--listen") listen = next();
     else if (a == "--dir") dir = next();
