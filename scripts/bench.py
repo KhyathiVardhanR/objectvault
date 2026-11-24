@@ -25,9 +25,9 @@ def sh(*args, env=None):
                           env={**os.environ, **(env or {})}).stdout
 
 
-def cluster(n, gateway_args=""):
+def cluster(n, gateway_args="", storage_args=""):
     sh(CLUSTER, "wipe")
-    sh(CLUSTER, "start", n, env={"GATEWAY_ARGS": gateway_args})
+    sh(CLUSTER, "start", n, env={"GATEWAY_ARGS": gateway_args, "STORAGE_ARGS": storage_args})
 
 
 def bench(*args):
@@ -97,17 +97,22 @@ def head_run(objects, requests, conc, hit_rate=None):
         secs -= warm * per_miss
         n -= warm
     r["server_lookup_us"] = secs / n * 1e6 if n else 0.0
+    cache_n = after["cache"][0] - before["cache"][0]
+    r["server_hit_rate"] = cache_n / n if n else 0.0
     return r
 
 
 def metadata_layout(name, chunk_size, obj_size, objects, requests, conc):
     extra = f"--chunk-size {chunk_size}"
-    cluster(3, f"--no-cache {extra}")
+    # Background scrubbing is off here: it re-hashes every chunk on disk and
+    # would compete for CPU with the metadata path being measured.
+    quiet = "--scrub-interval 0"
+    cluster(3, f"--no-cache {extra}", quiet)
     bench("populate", "--objects", objects, "--concurrency", 32, "--size", obj_size)
     base = head_run(objects, requests, conc)
     print(f"[{name}] postgres-only: client {base['mean_ms']:.3f}ms, server {base['server_lookup_us']:.0f}us", flush=True)
     sh(CLUSTER, "stop")
-    sh(CLUSTER, "start", 3, env={"GATEWAY_ARGS": extra})
+    sh(CLUSTER, "start", 3, env={"GATEWAY_ARGS": extra, "STORAGE_ARGS": quiet})
     rows = []
     for hr in [0.0, 0.25, 0.5, 0.75, 0.9, 1.0]:
         r = head_run(objects, requests, conc, hr)
@@ -115,21 +120,21 @@ def metadata_layout(name, chunk_size, obj_size, objects, requests, conc):
         print(f"[{name}] redis hit={r['hit_rate']:.2f}: client {r['mean_ms']:.3f}ms, server {r['server_lookup_us']:.0f}us",
               flush=True)
     lines = [f"\n### Metadata lookups, {name}: {objects:,} objects, {requests:,} HEAD requests, {conc} clients\n",
-             "| Configuration | Cache hit rate | Server-side lookup (µs) | Lookup vs PostgreSQL-only | "
+             "| Configuration | Cache hit rate (observed) | Server-side lookup (µs) | Lookup vs PostgreSQL-only | "
              "Client HEAD mean (ms) | Client p99 (ms) | HEAD vs PostgreSQL-only |",
              "|---|---:|---:|---:|---:|---:|---:|",
              f"| PostgreSQL only | – | {base['server_lookup_us']:.0f} | – | {base['mean_ms']:.3f} | {base['p99_ms']:.3f} | – |"]
     for r in rows:
         lk = (1 - r["server_lookup_us"] / base["server_lookup_us"]) * 100
         cl = (1 - r["mean_ms"] / base["mean_ms"]) * 100
-        lines.append(f"| PostgreSQL + Redis | {r['hit_rate']*100:.0f}% | {r['server_lookup_us']:.0f} | {lk:+.0f}% | "
+        lines.append(f"| PostgreSQL + Redis | {r['server_hit_rate']*100:.0f}% | {r['server_lookup_us']:.0f} | {lk:+.0f}% | "
                      f"{r['mean_ms']:.3f} | {r['p99_ms']:.3f} | {cl:+.0f}% |")
     return "\n".join(lines) + "\n"
 
 
 def metadata(objects, requests, conc):
-    out = metadata_layout("1-chunk objects (1 B)", "4M", "1", objects, requests, conc)
-    out += metadata_layout("16-chunk objects (64 KiB, 4 KiB chunks)", "4K", "64K", objects, requests, conc)
+    out = metadata_layout("16-chunk objects (64 KiB, 4 KiB chunks)", "4K", "64K", objects, requests, conc)
+    out += metadata_layout("1-chunk objects (1 B)", "4M", "1", objects, requests, conc)
     return out
 
 
