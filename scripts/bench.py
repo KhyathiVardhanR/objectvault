@@ -66,31 +66,71 @@ def throughput(nodes, duration):
     return "\n".join(lines) + "\n"
 
 
-def metadata(objects, requests, conc):
-    # Baseline: PostgreSQL only (cache disabled)
-    cluster(3, "--no-cache")
-    bench("populate", "--objects", objects, "--concurrency", 32)
-    base = bench("head", "--objects", objects, "--requests", requests, "--concurrency", conc)
-    print(f"postgres-only HEAD mean={base['mean_ms']:.3f}ms", flush=True)
-    # Same data with the Redis cache
+def lookup_stats():
+    """Server-side metadata lookup (count, sum seconds) per source from the gateway's histograms."""
+    out = {"cache": [0.0, 0.0], "database": [0.0, 0.0]}
+    with urllib.request.urlopen("http://127.0.0.1:9200/metrics") as r:
+        for line in r.read().decode().splitlines():
+            for src in out:
+                if line.startswith("ov_metadata_lookup_seconds_count") and f'source="{src}"' in line:
+                    out[src][0] = float(line.rsplit(" ", 1)[1])
+                if line.startswith("ov_metadata_lookup_seconds_sum") and f'source="{src}"' in line:
+                    out[src][1] = float(line.rsplit(" ", 1)[1])
+    return out
+
+
+def head_run(objects, requests, conc, hit_rate=None):
+    before = lookup_stats()
+    args = ["head", "--objects", objects, "--requests", requests, "--concurrency", conc]
+    if hit_rate is not None:
+        args += ["--hit-rate", hit_rate]
+    r = bench(*args)
+    after = lookup_stats()
+    # warm-up HEADs (cache fill phase) are excluded: subtract the requests' share only
+    n = sum(after[s][0] - before[s][0] for s in after)
+    secs = sum(after[s][1] - before[s][1] for s in after)
+    warm = n - (r["ops"] + r["errors"])
+    if warm > 0:  # warm-up lookups were all database misses
+        db_n = after["database"][0] - before["database"][0]
+        db_s = after["database"][1] - before["database"][1]
+        per_miss = db_s / db_n if db_n else 0
+        secs -= warm * per_miss
+        n -= warm
+    r["server_lookup_us"] = secs / n * 1e6 if n else 0.0
+    return r
+
+
+def metadata_layout(name, chunk_size, obj_size, objects, requests, conc):
+    extra = f"--chunk-size {chunk_size}"
+    cluster(3, f"--no-cache {extra}")
+    bench("populate", "--objects", objects, "--concurrency", 32, "--size", obj_size)
+    base = head_run(objects, requests, conc)
+    print(f"[{name}] postgres-only: client {base['mean_ms']:.3f}ms, server {base['server_lookup_us']:.0f}us", flush=True)
     sh(CLUSTER, "stop")
-    sh(CLUSTER, "start", 3)
+    sh(CLUSTER, "start", 3, env={"GATEWAY_ARGS": extra})
     rows = []
     for hr in [0.0, 0.25, 0.5, 0.75, 0.9, 1.0]:
-        r = bench("head", "--objects", objects, "--requests", requests, "--concurrency", conc, "--hit-rate", hr)
+        r = head_run(objects, requests, conc, hr)
         rows.append(r)
-        print(f"redis hit={r['hit_rate']:.2f} mean={r['mean_ms']:.3f}ms", flush=True)
-    lines = ["\n### Metadata lookups (HEAD), 3 nodes, "
-             f"{objects:,} objects, {requests:,} requests, {conc} clients\n",
-             "| Configuration | Cache hit rate | Mean (ms) | p50 (ms) | p99 (ms) | Lookups/s | Mean vs PostgreSQL-only |",
+        print(f"[{name}] redis hit={r['hit_rate']:.2f}: client {r['mean_ms']:.3f}ms, server {r['server_lookup_us']:.0f}us",
+              flush=True)
+    lines = [f"\n### Metadata lookups, {name}: {objects:,} objects, {requests:,} HEAD requests, {conc} clients\n",
+             "| Configuration | Cache hit rate | Server-side lookup (µs) | Lookup vs PostgreSQL-only | "
+             "Client HEAD mean (ms) | Client p99 (ms) | HEAD vs PostgreSQL-only |",
              "|---|---:|---:|---:|---:|---:|---:|",
-             f"| PostgreSQL only | – | {base['mean_ms']:.3f} | {base['p50_ms']:.3f} | {base['p99_ms']:.3f} | "
-             f"{base['ops_per_sec']:.0f} | – |"]
+             f"| PostgreSQL only | – | {base['server_lookup_us']:.0f} | – | {base['mean_ms']:.3f} | {base['p99_ms']:.3f} | – |"]
     for r in rows:
-        faster = (1 - r["mean_ms"] / base["mean_ms"]) * 100
-        lines.append(f"| PostgreSQL + Redis | {r['hit_rate']*100:.0f}% | {r['mean_ms']:.3f} | {r['p50_ms']:.3f} | "
-                     f"{r['p99_ms']:.3f} | {r['ops_per_sec']:.0f} | {faster:+.0f}% faster |")
+        lk = (1 - r["server_lookup_us"] / base["server_lookup_us"]) * 100
+        cl = (1 - r["mean_ms"] / base["mean_ms"]) * 100
+        lines.append(f"| PostgreSQL + Redis | {r['hit_rate']*100:.0f}% | {r['server_lookup_us']:.0f} | {lk:+.0f}% | "
+                     f"{r['mean_ms']:.3f} | {r['p99_ms']:.3f} | {cl:+.0f}% |")
     return "\n".join(lines) + "\n"
+
+
+def metadata(objects, requests, conc):
+    out = metadata_layout("1-chunk objects (1 B)", "4M", "1", objects, requests, conc)
+    out += metadata_layout("16-chunk objects (64 KiB, 4 KiB chunks)", "4K", "64K", objects, requests, conc)
+    return out
 
 
 def recovery(nodes, gb, trials):

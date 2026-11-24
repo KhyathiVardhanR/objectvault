@@ -39,6 +39,7 @@ struct Opts {
   int requests = 10000;
   double hit_rate = 0;
   bool json = false;
+  bool size_set = false;
 };
 
 class Conn {
@@ -175,6 +176,7 @@ int main(int argc, char** argv) {
       size_t n = std::stoull(s);
       char u = static_cast<char>(std::toupper(s.back()));
       o.size = u == 'K' ? n << 10 : u == 'M' ? n << 20 : n;
+      o.size_set = true;
     } else if (a == "--concurrency") o.concurrency = std::stoi(next());
     else if (a == "--duration") o.duration = std::stod(next());
     else if (a == "--objects") o.objects = std::stoi(next());
@@ -207,7 +209,7 @@ int main(int argc, char** argv) {
       return r.result() == http::status::ok && bytes == o.size;
     });
   } else if (o.mode == "populate") {
-    const std::string body = "x";
+    const std::string body = o.size_set ? random_body(o.size) : std::string("x");
     std::atomic<int> next{0};
     std::vector<std::thread> ts;
     auto t0 = Clock::now();
