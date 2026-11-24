@@ -40,3 +40,7 @@ target_link_libraries(ov-storage PRIVATE ov_proto ov_common prometheus-cpp::pull
 add_executable(ov-gateway src/gateway/main.cc src/gateway/metadata.cc)
 target_link_libraries(ov-gateway PRIVATE ov_proto ov_common prometheus-cpp::pull
   PkgConfig::PQXX PkgConfig::HIREDIS Boost::headers)
+
+# --- benchmark tool -------------------------------------------------------------
+add_executable(ov-bench tools/ov_bench.cc)
+target_link_libraries(ov-bench PRIVATE Boost::headers Threads::Threads)
