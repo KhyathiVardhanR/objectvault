@@ -450,7 +450,8 @@ class Gateway {
                     {"replicas", cluster_.replicas()},
                     {"underReplicated", repair_.under_replicated()},
                     {"lastRecoverySeconds", repair_.last_recovery_seconds()},
-                    {"cache", meta_.cache_enabled()}});
+                    {"cache", meta_.cache_enabled()},
+                    {"cacheFillPending", meta_.pending_fills()}});
     }
     error(res, http::status::not_found, "NoSuchAdminEndpoint");
   }
@@ -482,11 +483,15 @@ int main(int argc, char** argv) {
     if (a == "--listen") cfg.listen = next();
     else if (a == "--metrics") cfg.metrics = next();
     else if (a == "--pg") cfg.pg = next();
-    else if (a == "--redis") {
+    else if (a == "--redis") {  // host:port or unix:/path/to/socket
       auto r = next();
-      auto c = r.find(':');
-      cfg.redis_host = r.substr(0, c);
-      cfg.redis_port = std::stoi(r.substr(c + 1));
+      if (r.rfind("unix:", 0) == 0) {
+        cfg.redis_host = r;
+      } else {
+        auto c = r.find(':');
+        cfg.redis_host = r.substr(0, c);
+        cfg.redis_port = std::stoi(r.substr(c + 1));
+      }
     } else if (a == "--no-cache") cfg.cache = false;
     else if (a == "--replicas") cfg.replicas = std::stoul(next());
     else if (a == "--write-quorum") cfg.write_quorum = std::stoul(next());

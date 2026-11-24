@@ -6,6 +6,7 @@
 
 #include <hiredis/hiredis.h>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -102,11 +103,13 @@ class MetaStore {
   // Cache control (admin/benchmarks)
   void flush_cache();
   bool cache_enabled() const { return cache_enabled_; }
+  size_t pending_fills() const { return pending_fills_.load(); }
 
  private:
   pqxx::connection& pg();
   redisContext* redis();
   void cache_put(const std::string& ck, const ObjectMeta& m, const std::string& inv_version);
+  size_t append_fill(redisContext* r, const std::string& ck, const ObjectMeta& m, const std::string& inv_version);
   // Returns the cached value, and in *inv_version the key's invalidation
   // counter as observed in the same round trip (used to make fills safe).
   std::optional<ObjectMeta> cache_get(const std::string& ck, std::string* inv_version);
@@ -129,6 +132,7 @@ class MetaStore {
   };
   std::deque<Fill> fills_;
   std::thread filler_;
+  std::atomic<size_t> pending_fills_{0};
 
   std::string conninfo_;
   std::string redis_host_;

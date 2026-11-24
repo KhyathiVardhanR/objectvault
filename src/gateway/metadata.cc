@@ -106,7 +106,18 @@ void MetaStore::filler_loop() {
       fill_cv_.wait(lk, [this] { return !fills_.empty(); });
       batch.swap(fills_);
     }
-    for (auto& f : batch) cache_put(f.key, f.meta, f.inv_version);
+    // Pipeline the whole batch: one round trip instead of one per key.
+    auto* r = redis();
+    if (r && !r->err) {
+      size_t sent = 0;
+      for (auto& f : batch) sent += append_fill(r, f.key, f.meta, f.inv_version);
+      for (size_t i = 0; i < sent; i++) {
+        void* reply = nullptr;
+        if (redisGetReply(r, &reply) != REDIS_OK) break;
+        freeReplyObject(reply);
+      }
+    }
+    pending_fills_ -= batch.size();
   }
 }
 
@@ -127,7 +138,11 @@ redisContext* MetaStore::redis() {
   }
   if (!ctx) {
     timeval tv{0, 200000};
-    ctx = redisConnectWithTimeout(redis_host_.c_str(), redis_port_, tv);
+    if (redis_host_.rfind("unix:", 0) == 0) {
+      ctx = redisConnectUnixWithTimeout(redis_host_.substr(5).c_str(), tv);  // same-host: Unix socket
+    } else {
+      ctx = redisConnectWithTimeout(redis_host_.c_str(), redis_port_, tv);
+    }
     if (ctx && !ctx->err) redisSetTimeout(ctx, tv);
   }
   return ctx;
@@ -249,7 +264,10 @@ std::optional<ObjectMeta> MetaStore::get_object(const std::string& bucket, const
   }
   if (cache_enabled_) {
     std::lock_guard<std::mutex> g(fill_mu_);
-    if (fills_.size() < 100000) fills_.push_back({ck, m, inv});
+    if (fills_.size() < 100000) {
+      fills_.push_back({ck, m, inv});
+      pending_fills_++;
+    }
     fill_cv_.notify_one();
   }
   return m;
@@ -488,6 +506,22 @@ static std::string versioned(const std::string& ck) {
 static const char* kFillScript =
     "local v = redis.call('GET', KEYS[2]) or '' "
     "if v == ARGV[2] then redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3]) return 1 end return 0";
+
+size_t MetaStore::append_fill(redisContext* r, const std::string& ck, const ObjectMeta& m,
+                              const std::string& inv_version) {
+  json j{{"s", m.size}, {"e", m.etag}, {"t", m.content_type}, {"c", m.created}};
+  auto& arr = j["k"] = json::array();
+  for (const auto& c : m.chunks) arr.push_back({c.id, c.size, c.sha256_hex, c.nodes});
+  auto payload = j.dump();
+  auto key = versioned(ck);
+  auto inv_key = "inv:" + ck;
+  auto ttl = std::to_string(ttl_);
+  return redisAppendCommand(r, "EVAL %s 2 %b %b %b %b %b", kFillScript, key.data(), key.size(), inv_key.data(),
+                            inv_key.size(), payload.data(), payload.size(), inv_version.data(), inv_version.size(),
+                            ttl.data(), ttl.size()) == REDIS_OK
+             ? 1
+             : 0;
+}
 
 void MetaStore::cache_put(const std::string& ck, const ObjectMeta& m, const std::string& inv_version) {
   json j{{"s", m.size}, {"e", m.etag}, {"t", m.content_type}, {"c", m.created}};

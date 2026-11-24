@@ -242,6 +242,13 @@ int main(int argc, char** argv) {
           for (int k; (k = next++) < warm;) c.send(http::verb::head, "/" + o.bucket + "/meta/" + std::to_string(k));
         });
       for (auto& t : ts) t.join();
+      // Wait for the gateway's background cache fills to land before measuring.
+      Conn c(o);
+      for (int i = 0; i < 600; i++) {
+        auto r = c.send(http::verb::get, "/_admin/status");
+        if (r.body().find("\"cacheFillPending\":0") != std::string::npos) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      }
     }
     int cold_available = o.objects - warm;
     std::atomic<int> cold_next{0}, issued{0};
