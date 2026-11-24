@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package objectvault;
+
+// Storage nodes hold immutable, content-checksummed chunks. The gateway
+// decides placement and replication; nodes only store and verify bytes.
+service Storage {
+  rpc PutChunk(PutChunkRequest) returns (PutChunkResponse);
+  rpc GetChunk(GetChunkRequest) returns (GetChunkResponse);
+  rpc DeleteChunk(DeleteChunkRequest) returns (DeleteChunkResponse);
+  rpc Stat(StatRequest) returns (StatResponse);
+}
+
+message PutChunkRequest {
+  string chunk_id = 1;
+  bytes data = 2;
+  bytes sha256 = 3; // expected digest; the node verifies before acknowledging
+}
+
+message PutChunkResponse {}
+
+message GetChunkRequest {
+  string chunk_id = 1;
+}
+
+message GetChunkResponse {
+  bytes data = 1;
+  bytes sha256 = 2;
+}
+
+message DeleteChunkRequest {
+  string chunk_id = 1;
+}
+
+message DeleteChunkResponse {}
+
+message StatRequest {}
+
+message StatResponse {
+  string node_id = 1;
+  uint64 chunks = 2;
+  uint64 bytes_used = 3;
+  uint64 checksum_failures = 4;
+}
