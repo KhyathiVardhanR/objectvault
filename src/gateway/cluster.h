@@ -38,12 +38,19 @@ class Cluster {
  public:
   Cluster(const std::vector<NodeSpec>& nodes, size_t replicas, size_t write_quorum, size_t io_threads)
       : ring_(ids(nodes)), replicas_(replicas), quorum_(write_quorum), pool_(io_threads) {
-    grpc::ChannelArguments args;
-    args.SetMaxReceiveMessageSize(64 << 20);
-    args.SetMaxSendMessageSize(64 << 20);
+    // Several independent HTTP/2 connections per node: one connection's flow
+    // control window otherwise caps large concurrent chunk transfers.
     for (const auto& n : nodes) {
-      auto ch = grpc::CreateCustomChannel(n.addr, grpc::InsecureChannelCredentials(), args);
-      stubs_[n.id] = objectvault::Storage::NewStub(ch);
+      for (int c = 0; c < kConnsPerNode; c++) {
+        grpc::ChannelArguments args;
+        args.SetMaxReceiveMessageSize(64 << 20);
+        args.SetMaxSendMessageSize(64 << 20);
+        args.SetInt(GRPC_ARG_USE_LOCAL_SUBCHANNEL_POOL, 1);  // don't share the TCP connection
+        args.SetInt("grpc.channel_pool_index", c);
+        args.SetInt(GRPC_ARG_HTTP2_STREAM_LOOKAHEAD_BYTES, 8 << 20);
+        auto ch = grpc::CreateCustomChannel(n.addr, grpc::InsecureChannelCredentials(), args);
+        stubs_[n.id].push_back(objectvault::Storage::NewStub(ch));
+      }
       up_[n.id] = true;
       misses_[n.id] = 0;
     }
@@ -193,7 +200,8 @@ class Cluster {
                         std::function<void(const std::string&, const std::string&)> on_quarantined) {
     hb_ = std::thread([=, this] {
       for (;;) {
-        for (auto& [id, stub] : stubs_) {
+        for (auto& [id, pool] : stubs_) {
+          auto& stub = pool.front();
           objectvault::StatRequest req;
           objectvault::StatResponse resp;
           grpc::ClientContext ctx;
@@ -228,13 +236,18 @@ class Cluster {
     for (auto& n : nodes) out.push_back(n.id);
     return out;
   }
-  objectvault::Storage::Stub* stub(const std::string& node) { return stubs_.at(node).get(); }
+  objectvault::Storage::Stub* stub(const std::string& node) {
+    auto& v = stubs_.at(node);
+    return v[rr_.fetch_add(1, std::memory_order_relaxed) % v.size()].get();
+  }
+  static constexpr int kConnsPerNode = 8;
+  std::atomic<uint64_t> rr_{0};
   void note_failure(const std::string&, const grpc::Status&) {}
 
   HashRing ring_;
   size_t replicas_, quorum_;
   boost::asio::thread_pool pool_;
-  std::map<std::string, std::unique_ptr<objectvault::Storage::Stub>> stubs_;
+  std::map<std::string, std::vector<std::unique_ptr<objectvault::Storage::Stub>>> stubs_;
   mutable std::mutex mu_;
   std::map<std::string, bool> up_;
   std::map<std::string, int> misses_;
